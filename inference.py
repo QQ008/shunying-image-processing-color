@@ -1,302 +1,263 @@
-"""
-骑行者颜色提取系统推理接口
-"""
-
 import os
-import sys
-import time
-import json
-import argparse
-import logging
-import glob
-import numpy as np
-import cv2
 import torch
-from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import torch.nn as nn
+from torchvision import transforms
+import numpy as np
+from PIL import Image
+import argparse
+import json
+from typing import Dict, List, Tuple, Union, Optional
 
-# 添加项目路径
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from utils.logger import setup_logger, log_processing_stats, log_color_result, create_batch_id
-from utils.color_utils import visualize_colors
-from src.color_extraction.segmentation_model import CyclistSegmentationModel
-from src.color_extraction.color_extraction_model import ColorExtractionModel
-from src.color_extraction.data_processor import preprocess_image
-import config
+from color_predictor import RiderColorPredictor
 
-def parse_args():
+class ColorPredictor:
     """
-    解析命令行参数
+    用于对骑手图像进行颜色预测的类。
     
-    Returns:
-        args: 解析后的参数
+    该类加载一个训练好的模型，并提供方法来预测
+    骑手图像中不同身体部位的颜色。
     """
-    parser = argparse.ArgumentParser(description="骑行者颜色提取系统")
-    
-    # 输入输出参数
-    parser.add_argument("--input", type=str, default=config.INPUT_DIR,
-                        help="输入图像目录或单张图像路径")
-    parser.add_argument("--output", type=str, default=config.OUTPUT_DIR,
-                        help="输出结果目录")
-    
-    # 模型参数
-    parser.add_argument("--segmentation_model", type=str, 
-                        default=os.path.join(config.MODEL_DIR, "segmentation_model_best.pth"),
-                        help="分割模型路径")
-    parser.add_argument("--device", type=str, default=config.DEVICE,
-                        help="计算设备")
-    
-    # 处理参数
-    parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE,
-                        help="批处理大小")
-    parser.add_argument("--workers", type=int, default=config.NUM_WORKERS,
-                        help="并行处理的工作线程数")
-    parser.add_argument("--visualize", action="store_true",
-                        help="是否生成颜色可视化图像")
-    
-    return parser.parse_args()
-
-def process_single_image(image_path, extraction_model, output_dir, visualize=False, logger=None):
-    """
-    处理单张图像
-    
-    Args:
-        image_path: 图像路径
-        extraction_model: 颜色提取模型
-        output_dir: 输出目录
-        visualize: 是否生成可视化
-        logger: 日志记录器
+    def __init__(self, 
+                 model_path: str, 
+                 device: str = None,
+                 color_map_path: str = None,
+                 confidence_threshold: float = 0.5):
+        """
+        初始化颜色预测器。
         
-    Returns:
-        result: 处理结果
-        success: 是否成功
-    """
-    try:
-        # 提取颜色
-        result = extraction_model.extract_colors(image_path)
+        参数：
+            model_path: 保存的模型检查点路径
+            device: 运行推理的设备 ('cuda' 或 'cpu')
+            color_map_path: 将类别索引映射到颜色名称的JSON文件路径
+            confidence_threshold: 置信预测的阈值
+        """
+        # 设置设备
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"使用设备: {self.device}")
         
-        # 记录结果
-        if logger:
-            log_color_result(logger, image_path, result)
+        # 如果提供了颜色映射，则加载
+        self.color_map = None
+        if color_map_path and os.path.exists(color_map_path):
+            with open(color_map_path, 'r') as f:
+                self.color_map = json.load(f)
+            print(f"加载了包含 {len(self.color_map)} 个颜色类别的颜色映射")
         
-        # 保存结果
-        if output_dir:
-            # 创建输出目录
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # 获取文件名（不含扩展名）
-            base_name = os.path.splitext(os.path.basename(image_path))[0]
-            
-            # 保存JSON结果
-            result_json = {}
-            for part, colors in result.items():
-                if colors:
-                    result_json[part] = {
-                        "color": colors[0][0],
-                        "confidence": float(colors[0][1])
-                    }
-                else:
-                    result_json[part] = {
-                        "color": "unknown",
-                        "confidence": 0.0
-                    }
-            
-            json_path = os.path.join(output_dir, f"{base_name}_colors.json")
-            with open(json_path, 'w') as f:
-                json.dump(result_json, f, indent=4)
-            
-            # 生成可视化图像
-            if visualize:
-                # 读取原始图像
-                image = cv2.imread(image_path)
-                if image is not None:
-                    # 为每个部位创建颜色条
-                    for part, colors in result.items():
-                        if not colors:
-                            continue
-                        
-                        # 提取部位的BGR颜色值和置信度
-                        part_colors = []
-                        percentages = []
-                        
-                        for color_name, confidence in colors:
-                            # 获取颜色的BGR值（这里需要实现从颜色名称到BGR的映射）
-                            from utils.color_utils import color_name_to_rgb
-                            rgb = color_name_to_rgb(color_name)
-                            bgr = (rgb[2], rgb[1], rgb[0])  # 转换为BGR
-                            part_colors.append(bgr)
-                            percentages.append(confidence)
-                        
-                        # 生成颜色可视化
-                        color_vis = visualize_colors(part_colors, percentages)
-                        
-                        # 保存可视化图像
-                        vis_path = os.path.join(output_dir, f"{base_name}_{part}_colors.png")
-                        cv2.imwrite(vis_path, color_vis)
+        # 设置置信度阈值
+        self.confidence_threshold = confidence_threshold
         
-        return result, True
-    
-    except Exception as e:
-        if logger:
-            logger.error(f"处理图像失败 [{os.path.basename(image_path)}]: {str(e)}")
-        return None, False
-
-def process_batch(image_paths, extraction_model, output_dir, visualize=False, workers=4, logger=None):
-    """
-    批量处理图像
-    
-    Args:
-        image_paths: 图像路径列表
-        extraction_model: 颜色提取模型
-        output_dir: 输出目录
-        visualize: 是否生成可视化
-        workers: 工作线程数
-        logger: 日志记录器
+        # 加载模型
+        self.model = self._load_model(model_path)
+        self.model.to(self.device)
+        self.model.eval()
         
-    Returns:
-        results: 处理结果列表
-        stats: 处理统计信息
-    """
-    results = []
-    success_count = 0
-    error_count = 0
-    
-    start_time = time.time()
-    
-    # 使用线程池并行处理
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        # 提交所有任务
-        future_to_path = {
-            executor.submit(
-                process_single_image, 
-                path, 
-                extraction_model, 
-                output_dir, 
-                visualize, 
-                logger
-            ): path for path in image_paths
-        }
+        # 从模型获取部位名称
+        self.part_names = self.model.color_predictor.part_names
+        print(f"模型预测以下部位的颜色: {', '.join(self.part_names)}")
         
-        # 处理完成的任务
-        for future in tqdm(as_completed(future_to_path), total=len(image_paths), desc="处理图像"):
-            path = future_to_path[future]
-            try:
-                result, success = future.result()
-                if success:
-                    results.append((path, result))
-                    success_count += 1
-                else:
-                    error_count += 1
-            except Exception as e:
-                if logger:
-                    logger.error(f"处理任务失败 [{os.path.basename(path)}]: {str(e)}")
-                error_count += 1
+        # 设置图像转换
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
     
-    # 记录处理统计信息
-    if logger:
-        log_processing_stats(
-            logger, 
-            start_time, 
-            len(image_paths), 
-            success_count, 
-            error_count
+    def _load_model(self, model_path: str) -> nn.Module:
+        """
+        从检查点加载模型。
+        
+        参数：
+            model_path: 模型检查点路径
+        
+        返回：
+            加载的模型
+        """
+        checkpoint = torch.load(model_path, map_location=self.device)
+        
+        # 从检查点确定模型架构
+        # 这假设检查点包含关于模型架构的信息
+        # 在实际实现中，您可能需要显式地保存和加载这些信息
+        
+        # 现在，让我们假设标准配置
+        model = RiderColorPredictor(
+            feature_extractor_name='mobilenet_v3_small',
+            num_classes=14,  # 这应该与您的训练配置匹配
         )
+        
+        # 从检查点加载状态字典
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"从 {model_path} 加载模型（训练了 {checkpoint['epoch']} 个周期）")
+        return model
     
-    stats = {
-        "total": len(image_paths),
-        "success": success_count,
-        "error": error_count,
-        "time": time.time() - start_time
-    }
+    def preprocess_image(self, image_path: str) -> torch.Tensor:
+        """
+        预处理图像以进行推理。
+        
+        参数：
+            image_path: 图像文件路径
+        
+        返回：
+            预处理后的图像张量
+        """
+        # 加载并转换为RGB
+        image = Image.open(image_path).convert('RGB')
+        
+        # 应用转换
+        image_tensor = self.transform(image)
+        
+        # 添加批次维度
+        image_tensor = image_tensor.unsqueeze(0)
+        return image_tensor
     
-    return results, stats
+    def predict(self, image_path: str) -> Dict[str, Dict[str, Union[int, float, str]]]:
+        """
+        预测单个图像的颜色。
+        
+        参数：
+            image_path: 图像文件路径
+        
+        返回：
+            包含每个身体部位预测的字典
+        """
+        # 预处理图像
+        image_tensor = self.preprocess_image(image_path)
+        image_tensor = image_tensor.to(self.device)
+        
+        # 执行推理
+        with torch.no_grad():
+            outputs = self.model(image_tensor)
+        
+        # 处理输出
+        predictions = {}
+        for part, logits in outputs.items():
+            # 应用softmax获取概率
+            probs = torch.softmax(logits, dim=1)
+            
+            # 获取预测类别和置信度
+            confidence, class_idx = torch.max(probs, dim=1)
+            
+            # 转换为Python类型
+            class_idx = class_idx.item()
+            confidence = confidence.item()
+            
+            # 如果有颜色映射，则获取颜色名称
+            color_name = "unknown"
+            if self.color_map and str(class_idx) in self.color_map:
+                color_name = self.color_map[str(class_idx)]
+            
+            # 存储预测
+            predictions[part] = {
+                'class_idx': class_idx,
+                'confidence': confidence,
+                'color_name': color_name,
+                'is_confident': confidence >= self.confidence_threshold
+            }
+            
+            # 添加所有概率以进行详细分析
+            predictions[part]['all_probs'] = probs[0].cpu().numpy().tolist()
+        
+        return predictions
+    
+    def batch_predict(self, image_paths: List[str]) -> List[Dict[str, Dict[str, Union[int, float, str]]]]:
+        """
+        预测多个图像的颜色。
+        
+        参数：
+            image_paths: 图像文件路径列表
+        
+        返回：
+            预测字典列表，每个图像一个
+        """
+        results = []
+        for image_path in image_paths:
+            predictions = self.predict(image_path)
+            results.append({
+                'image_path': image_path,
+                'predictions': predictions
+            })
+        return results
+    
+    def print_predictions(self, predictions: Dict[str, Dict[str, Union[int, float, str]]]):
+        """
+        以人类可读的格式打印预测结果。
+        
+        参数：
+            predictions: 来自predict()的预测字典
+        """
+        print("颜色预测:")
+        print("=================")
+        for part, pred in predictions.items():
+            confidence_str = f"{pred['confidence']:.2f}"
+            status = "✓" if pred['is_confident'] else "?"
+            
+            if pred['is_confident']:
+                print(f"{part:10s}: {pred['color_name']:10s} ({confidence_str}) {status}")
+            else:
+                print(f"{part:10s}: {"uncertain":10s} ({confidence_str}) {status}")
+        print("=================")
+
+
+# ----- 命令行界面 -----
 
 def main():
-    """主函数"""
-    # 解析命令行参数
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="使用骑手颜色预测器运行推理")
     
-    # 创建输出目录
-    os.makedirs(args.output, exist_ok=True)
+    # 必需参数
+    parser.add_argument('--model_path', type=str, required=True,
+                        help='保存的模型检查点路径')
+    parser.add_argument('--image_path', type=str, required=True,
+                        help='要预测的图像或图像目录的路径')
     
-    # 创建日志目录
-    log_dir = os.path.dirname(config.LOG_FILE)
-    os.makedirs(log_dir, exist_ok=True)
+    # 可选参数
+    parser.add_argument('--color_map', type=str, default=None,
+                        help='将类别索引映射到颜色名称的JSON文件路径')
+    parser.add_argument('--confidence_threshold', type=float, default=0.5,
+                        help='置信预测的阈值')
+    parser.add_argument('--output_json', type=str, default=None,
+                        help='保存预测结果为JSON的路径')
+    parser.add_argument('--device', type=str, default=None,
+                        choices=['cuda', 'cpu'], help='运行推理的设备')
     
-    # 设置日志记录器
-    batch_id = create_batch_id()
-    log_file = os.path.join(log_dir, f"inference_{batch_id}.log")
-    logger = setup_logger("inference", log_file, level=getattr(logging, config.LOG_LEVEL))
+    args = parser.parse_args()
     
-    # 记录开始处理
-    logger.info(f"开始处理批次 {batch_id}")
-    logger.info(f"参数: {vars(args)}")
-    
-    # 初始化模型
-    device = torch.device(args.device)
-    
-    # 加载分割模型
-    logger.info("加载分割模型...")
-    segmentation_model = CyclistSegmentationModel(
-        model_path=args.segmentation_model,
-        device=device
+    # 初始化预测器
+    predictor = ColorPredictor(
+        model_path=args.model_path,
+        device=args.device,
+        color_map_path=args.color_map,
+        confidence_threshold=args.confidence_threshold
     )
     
-    # 初始化颜色提取模型
-    logger.info("初始化颜色提取模型...")
-    extraction_model = ColorExtractionModel(
-        segmentation_model=segmentation_model,
-        device=device
-    )
-    
-    # 获取输入图像路径
-    if os.path.isdir(args.input):
-        # 如果输入是目录，获取所有图像文件
-        image_paths = []
-        for ext in ['jpg', 'jpeg', 'png', 'bmp']:
-            image_paths.extend(glob.glob(os.path.join(args.input, f"*.{ext}")))
-            image_paths.extend(glob.glob(os.path.join(args.input, f"*.{ext.upper()}")))
+    # 收集图像路径
+    image_paths = []
+    if os.path.isdir(args.image_path):
+        # 如果提供了目录，则处理其中的所有图像
+        for filename in os.listdir(args.image_path):
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                image_paths.append(os.path.join(args.image_path, filename))
     else:
-        # 如果输入是单个文件
-        image_paths = [args.input]
+        # 如果提供了单个图像
+        image_paths.append(args.image_path)
     
-    logger.info(f"找到 {len(image_paths)} 个图像文件")
+    # 运行预测
+    results = predictor.batch_predict(image_paths)
     
-    # 处理图像
-    logger.info("开始处理图像...")
-    results, stats = process_batch(
-        image_paths,
-        extraction_model,
-        args.output,
-        args.visualize,
-        args.workers,
-        logger
-    )
+    # 打印预测
+    for result in results:
+        print(f"\n图像: {result['image_path']}")
+        predictor.print_predictions(result['predictions'])
     
-    # 保存汇总结果
-    summary_path = os.path.join(args.output, f"summary_{batch_id}.json")
-    summary = {
-        "batch_id": batch_id,
-        "stats": stats,
-        "results": [
-            {
-                "image": os.path.basename(path),
-                "colors": {
-                    part: {
-                        "color": colors[0][0] if colors else "unknown",
-                        "confidence": float(colors[0][1]) if colors else 0.0
-                    } for part, colors in result.items()
-                }
-            } for path, result in results
-        ]
-    }
-    
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=4)
-    
-    logger.info(f"处理完成，结果保存至 {args.output}")
-    logger.info(f"处理统计: 总数={stats['total']}, 成功={stats['success']}, "
-               f"失败={stats['error']}, 耗时={stats['time']:.2f}秒")
+    # 如果需要，将结果保存为JSON
+    if args.output_json:
+        # 将numpy数组转换为列表以进行JSON序列化
+        for result in results:
+            for part, pred in result['predictions'].items():
+                if isinstance(pred['all_probs'], np.ndarray):
+                    pred['all_probs'] = pred['all_probs'].tolist()
+        
+        with open(args.output_json, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\n已将预测结果保存到 {args.output_json}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main() 
